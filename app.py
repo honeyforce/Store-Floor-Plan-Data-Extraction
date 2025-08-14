@@ -6,35 +6,16 @@ import pandas as pd
 import pytesseract
 import streamlit as st
 
-# OPTIONAL (Windows): set this if Tesseract isn't on PATH
+# If Tesseract isn't on PATH (Windows), uncomment and set this:
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-st.set_page_config(page_title="Clip-Strip Extractor (Dot in Box)", page_icon="🟨", layout="centered")
-st.title("🟨 Clip-Strip Extractor — Dot Inside Black Box")
-st.caption("Upload a floor plan image + store Excel, give dot color, and get Location → Adjacency → Preferred (2nd/3rd).")
+st.set_page_config(page_title="Clip-Strip Extractor (Red Outline)", page_icon="🟥", layout="centered")
+st.title("🟥 Clip-Strip Extractor — Red Outline → Interior OCR")
+st.caption("Upload a floor plan image + store Excel. The app detects RED outlines, reads text inside, and matches to Excel.")
 
-# ===================== Utilities =====================
-
-def hex_to_rgb(hex_str: str):
-    hs = hex_str.strip().lstrip('#')
-    if len(hs) == 3:
-        hs = ''.join([c*2 for c in hs])
-    r = int(hs[0:2], 16)
-    g = int(hs[2:4], 16)
-    b = int(hs[4:6], 16)
-    return (r, g, b)
-
-def rgb_to_hsv_range(rgb, tol_h=18, tol_s=120, tol_v=120):
-    """OpenCV HSV: H 0..179, S/V 0..255."""
-    bgr = np.uint8([[list(reversed(rgb))]])  # RGB→BGR
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[0, 0]
-    H, S, V = hsv.tolist()
-    low  = np.array([max(0,   H - tol_h), max(0,   S - tol_s), max(0,   V - tol_v)], dtype=np.uint8)
-    high = np.array([min(179, H + tol_h), min(255, S + tol_s), min(255, V + tol_v)], dtype=np.uint8)
-    return low, high
-
+# ---------- Helpers ----------
 def norm_export_loc(s: str):
-    """Normalize Excel 'Location' to A-S-## form (strip BAY, spaces, fancy dashes, zeros)."""
+    """Normalize Excel 'Location' to A-S-## (strip BAY, spaces, fancy dashes, zeros)."""
     s = str(s).upper().strip()
     s = re.sub(r'\s+', '', s)
     s = s.replace('–','-').replace('—','-')
@@ -52,111 +33,69 @@ def find_sheets(xls: pd.ExcelFile):
     export_sheet = None; pref_sheet = None
     for s in xls.sheet_names:
         sl = s.lower()
-        if export_sheet is None and "export" in sl:
-            export_sheet = s
-        if pref_sheet is None and "prefer" in sl:
-            pref_sheet = s
+        if export_sheet is None and "export" in sl:   export_sheet = s
+        if pref_sheet   is None and "prefer" in sl:   pref_sheet   = s
     export_sheet = export_sheet or xls.sheet_names[0]
     pref_sheet   = pref_sheet   or xls.sheet_names[-1]
     return export_sheet, pref_sheet
 
 def extract_location_from_text(s):
     """Return normalized 'A-S-##' from OCR text (handle common OCR quirks)."""
-    if not s:
-        return None
+    if not s: return None
     t = s.upper().replace("—","-").replace("–","-")
-    t = re.sub(r'\s+', '', t)
-    t = t.replace('I','1')  # common misread
+    t = re.sub(r'\s+', '', t).replace('I','1')
     m = re.search(r'(\d-[RL]-\d{1,2})', t)
     return m.group(1) if m else None
 
-# ===================== Detection & OCR =====================
+# ---------- Red-outline detection ----------
+def red_hsv_ranges(hue_tol=10, sat_tol=120, val_tol=120):
+    """
+    Red wraps around the HSV hue circle (0 and 180). We build two ranges:
+    low reds (~0) and high reds (~180).
+    """
+    # Base red in OpenCV HSV is around H≈0 and H≈179.
+    # We'll cover both with two masks.
+    lo1 = np.array([0,            max(0, 200 - sat_tol), max(0, 200 - val_tol)], dtype=np.uint8)
+    hi1 = np.array([hue_tol,      255,                   255],                   dtype=np.uint8)
+    lo2 = np.array([180 - hue_tol, max(0, 200 - sat_tol), max(0, 200 - val_tol)], dtype=np.uint8)
+    hi2 = np.array([179,          255,                   255],                   dtype=np.uint8)
+    return (lo1, hi1, lo2, hi2)
 
-def detect_yellow_dots(hsv_img, lower_hsv, upper_hsv):
-    """Return list of dot dicts: {'box': (x,y,w,h), 'center': (cx,cy)}."""
-    mask = cv2.inRange(hsv_img, lower_hsv, upper_hsv)
+def detect_red_outlines(hsv_img, hue_tol=10, sat_tol=120, val_tol=120):
+    lo1, hi1, lo2, hi2 = red_hsv_ranges(hue_tol, sat_tol, val_tol)
+    mask1 = cv2.inRange(hsv_img, lo1, hi1)
+    mask2 = cv2.inRange(hsv_img, lo2, hi2)
+    mask  = cv2.bitwise_or(mask1, mask2)
+
+    # Bridge tiny gaps in strokes
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, 1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, 2)
+
     cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    dots = []
-    for c in cnts:
-        x,y,w,h = cv2.boundingRect(c)
-        area = w*h
-        if 20 <= area <= 2500 and 5 <= w <= 70 and 5 <= h <= 70:
-            cx, cy = x + w//2, y + h//2
-            dots.append({"box": (x,y,w,h), "center": (cx,cy)})
-    # Stable reading order: rows then x
-    dots.sort(key=lambda d: (d["center"][1]//80, d["center"][0]))
-    return dots
+    return cnts, mask
 
-def find_black_box_containing_dot(bgr_img, dot_center, search_pad_px=80):
-    """
-    Find the black rectangular label box that contains the dot.
-    1) Make a local search window around the dot.
-    2) Detect dark edges/lines; find rectangular contours.
-    3) Return bounding rect of the contour that contains the dot.
-    """
-    H, W = bgr_img.shape[:2]
-    cx, cy = dot_center
-    x1 = max(0, cx - search_pad_px); y1 = max(0, cy - search_pad_px)
-    x2 = min(W, cx + search_pad_px); y2 = min(H, cy + search_pad_px)
-    roi = bgr_img[y1:y2, x1:x2]
+def interior_mask_from_outline(contour, shape, erode_px=3):
+    """Filled interior from an outline; erode to avoid the colored stroke."""
+    h, w = shape[:2]
+    filled = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(filled, [contour], -1, 255, thickness=cv2.FILLED)
+    if erode_px > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_px, erode_px))
+        filled = cv2.erode(filled, k, 1)
+    return filled
 
-    if roi.size == 0:
-        return None
+def crop_by_mask(bgr_img, mask):
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return None, None
+    x1, x2 = xs.min(), xs.max()
+    y1, y2 = ys.min(), ys.max()
+    return bgr_img[y1:y2+1, x1:x2+1], (x1, y1, x2-x1+1, y2-y1+1)
 
-    # Emphasize black box lines
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    # Slight blur to join line gaps
-    gray_blur = cv2.GaussianBlur(gray, (3,3), 0)
-    # Morphological blackhat to highlight dark lines on light background
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
-    blackhat = cv2.morphologyEx(gray_blur, cv2.MORPH_BLACKHAT, kernel)
-    # Canny edges on blackhat
-    edges = cv2.Canny(blackhat, 30, 120)
-    # Close small gaps
-    mker = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
-    edges = cv2.morphologyEx(edges, cv2.MORPH_DILATE, mker, iterations=1)
-
-    cnts,_ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    best_rect = None
-    best_score = -1
-    for c in cnts:
-        rx, ry, rw, rh = cv2.boundingRect(c)
-        area = rw * rh
-        if area < 300 or area > (search_pad_px*search_pad_px*3):
-            continue
-        # approximate polygon for rectangularity
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.03 * peri, True)
-        # Heuristic: 4 corners, mostly rectangular-ish
-        if len(approx) < 4 or len(approx) > 8:
-            continue
-
-        # Convert to absolute coordinates
-        abs_x1, abs_y1 = x1 + rx, y1 + ry
-        abs_x2, abs_y2 = abs_x1 + rw, abs_y1 + rh
-
-        # Check if dot is inside this rect
-        if not (abs_x1 <= cx <= abs_x2 and abs_y1 <= cy <= abs_y2):
-            continue
-
-        # Prefer tighter boxes (smaller area) that still contain the dot
-        score = -area
-        if score > best_score:
-            best_score = score
-            best_rect = (abs_x1, abs_y1, rw, rh)
-
-    return best_rect  # (x, y, w, h) in absolute coords
-
+# ---------- OCR ----------
 def preprocess_box_for_ocr(box_img):
-    """
-    Produce a list of OCR-friendly variants from a cropped label box.
-    """
+    """OCR-friendly variants from interior region."""
     gray = cv2.cvtColor(box_img, cv2.COLOR_BGR2GRAY)
-    # Upscale for thin fonts
     up = cv2.resize(gray, None, fx=3.2, fy=3.2, interpolation=cv2.INTER_CUBIC)
 
     variants = []
@@ -172,11 +111,8 @@ def preprocess_box_for_ocr(box_img):
     variants.extend([cv2.bitwise_not(v) for v in base])
     return variants
 
-def ocr_box_text(box_img):
-    """
-    OCR the text inside the label box; return raw and cleaned results.
-    We try multiple variants & PSM modes; then extract the location pattern.
-    """
+def ocr_interior_text(box_img):
+    """Return (raw_text, extracted_location)."""
     cfgs = [
         "--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-/ ",
         "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-/ ",
@@ -188,33 +124,18 @@ def ocr_box_text(box_img):
             txt = pytesseract.image_to_string(var, config=cfg)
             if len(txt) > len(best_raw):
                 best_raw = txt
-            # Quick check if location is already present
             loc = extract_location_from_text(txt)
             if loc:
                 return txt, loc
-    # If not found, still attempt extraction from the best_raw
     return best_raw, extract_location_from_text(best_raw)
 
-# ===================== Pipeline =====================
-
+# ---------- Pipeline ----------
 def run_pipeline(image_bytes: bytes, excel_bytes: bytes,
-                 hex_color: str | None, rgb_color: str | None,
-                 tol_h: int, tol_s: int, tol_v: int,
+                 hue_tol: int, sat_tol: int, val_tol: int,
+                 erode_px: int,
                  progress_cb=lambda pct, msg: None):
 
-    # 1) Color → HSV range
-    if hex_color and hex_color.strip():
-        rgb = hex_to_rgb(hex_color)
-    elif rgb_color and rgb_color.strip():
-        parts = [int(x) for x in rgb_color.split(',')]
-        if len(parts) != 3:
-            raise ValueError("RGB must be 'R,G,B'")
-        rgb = tuple(parts)
-    else:
-        raise ValueError("Provide a HEX or RGB dot color.")
-    lower_hsv, upper_hsv = rgb_to_hsv_range(rgb, tol_h, tol_s, tol_v)
-
-    # 2) Load Excel
+    # Load Excel
     progress_cb(10, "Loading Excel…")
     xls = pd.ExcelFile(io.BytesIO(excel_bytes))
     export_sheet, pref_sheet = find_sheets(xls)
@@ -231,7 +152,7 @@ def run_pipeline(image_bytes: bytes, excel_bytes: bytes,
         raise RuntimeError(f"'{pref_sheet}' must contain 'SECTION' (and ideally 'PREFERRED', '2ND', '3RD'). Found: {df_pref.columns.tolist()}")
     df_pref["_SECTION_NORM"] = df_pref["SECTION"].astype(str).str.upper().str.strip()
 
-    # 3) Decode image
+    # Decode image
     progress_cb(20, "Reading image…")
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -239,32 +160,26 @@ def run_pipeline(image_bytes: bytes, excel_bytes: bytes,
         raise RuntimeError("Could not decode the uploaded image.")
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
-    # 4) Detect yellow dots
-    progress_cb(35, "Detecting yellow dots…")
-    dots = detect_yellow_dots(hsv, lower_hsv, upper_hsv)
-    progress_cb(45, f"Found {len(dots)} dots.")
+    # Detect red outlines
+    progress_cb(35, "Detecting red outlines…")
+    contours, mask_outline = detect_red_outlines(hsv, hue_tol, sat_tol, val_tol)
+    progress_cb(45, f"Found {len(contours)} outline(s).")
 
-    # 5) For each dot, find its black box and OCR only inside that box
-    progress_cb(55, f"OCR boxes for {len(dots)} dots…")
+    # OCR each interior
+    progress_cb(55, f"OCR interior for {len(contours)} outline(s)…")
     out_rows, failures, samples = [], [], []
-    total = len(dots) or 1
+    total = len(contours) or 1
 
-    for i, d in enumerate(dots, start=1):
-        (cx, cy) = d["center"]
-        rect = find_black_box_containing_dot(bgr, (cx, cy), search_pad_px=90)
+    for i, c in enumerate(contours, start=1):
+        interior_mask = interior_mask_from_outline(c, bgr.shape, erode_px=erode_px)
+        crop, rect = crop_by_mask(bgr, interior_mask)
 
         raw_text = None
         loc_code = None
-        if rect is not None:
-            x, y, w, h = rect
-            # Slight insets to avoid box border lines in OCR
-            inset = max(2, min(w,h)//25)
-            xi1 = max(0, x + inset); yi1 = max(0, y + inset)
-            xi2 = min(bgr.shape[1], x + w - inset); yi2 = min(bgr.shape[0], y + h - inset)
-            box_crop = bgr[yi1:yi2, xi1:xi2]
-            raw_text, loc_code = ocr_box_text(box_crop)
+        if crop is not None:
+            raw_text, loc_code = ocr_interior_text(crop)
         else:
-            failures.append({"dot": i, "reason": "No black box found around dot"})
+            failures.append({"outline": i, "reason": "Empty interior mask"})
 
         adjacency = preferred = second = third = None
         if loc_code:
@@ -273,12 +188,12 @@ def run_pipeline(image_bytes: bytes, excel_bytes: bytes,
                 adjacency = row["Adjacency"]
                 pr = df_pref[df_pref["_SECTION_NORM"] == str(adjacency).upper().strip()]
                 preferred = pr.iloc[0]["PREFERRED"] if ("PREFERRED" in df_pref.columns and not pr.empty) else None
-                second    = pr.iloc[0]["2ND"] if ("2ND" in df_pref.columns and not pr.empty) else None
-                third     = pr.iloc[0]["3RD"] if ("3RD" in df_pref.columns and not pr.empty) else None
+                second    = pr.iloc[0]["2ND"]       if ("2ND" in df_pref.columns       and not pr.empty) else None
+                third     = pr.iloc[0]["3RD"]       if ("3RD" in df_pref.columns       and not pr.empty) else None
             else:
-                failures.append({"dot": i, "reason": "No Excel match", "ocr_text": raw_text})
+                failures.append({"outline": i, "reason": "No Excel match", "ocr_text": raw_text})
         else:
-            failures.append({"dot": i, "reason": "OCR empty / no location found", "ocr_text": raw_text})
+            failures.append({"outline": i, "reason": "OCR empty / no location", "ocr_text": raw_text})
 
         out_rows.append({
             "Location": loc_code,
@@ -289,26 +204,21 @@ def run_pipeline(image_bytes: bytes, excel_bytes: bytes,
         })
 
         if len(samples) < 5:
-            # Save a small debug crop around the box (or dot if box not found)
             if rect is not None:
                 x, y, w, h = rect
-                pad = 16
+                pad = 12
                 x1 = max(0, x - pad); y1 = max(0, y - pad)
                 x2 = min(bgr.shape[1], x + w + pad); y2 = min(bgr.shape[0], y + h + pad)
-                crop = cv2.cvtColor(bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+                crop_dbg = cv2.cvtColor(bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
                 cap = f"LOC: {loc_code or '(none)'}"
             else:
-                x,y,w,h = d["box"]
-                pad = 24
-                x1 = max(0, x - pad); y1 = max(0, y - pad)
-                x2 = min(bgr.shape[1], x + w + pad); y2 = min(bgr.shape[0], y + h + pad)
-                crop = cv2.cvtColor(bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
-                cap = "No box found"
-            samples.append((crop, cap, raw_text or ""))
+                crop_dbg = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                cap = "No rect"
+            samples.append((crop_dbg, cap, raw_text or ""))
 
         progress_cb(55 + int(35*i/total), f"OCR & matching… ({i}/{total})")
 
-    # 6) Build output Excel (in memory)
+    # Output Excel
     progress_cb(95, "Preparing output Excel…")
     df_out = pd.DataFrame(out_rows).drop_duplicates(subset=["Location"])
     excel_buf = io.BytesIO()
@@ -317,27 +227,20 @@ def run_pipeline(image_bytes: bytes, excel_bytes: bytes,
     excel_buf.seek(0)
     progress_cb(100, "Done.")
 
-    diagnostics = {"dots_found": len(dots), "failures": failures, "samples": samples}
+    diagnostics = {"outlines_found": len(contours), "failures": failures, "samples": samples}
     return df_out, excel_buf, diagnostics
 
-# ===================== UI =====================
-
+# ---------- UI ----------
 with st.form("extract_form"):
     img_file  = st.file_uploader("Floor plan image (PNG/JPG)", type=["png","jpg","jpeg"])
     xlsx_file = st.file_uploader("Store Excel (Export + Preferred sheets)", type=["xlsx"])
-    c1, c2 = st.columns(2)
-    with c1:
-        hex_color = st.text_input("Dot Color (HEX, e.g. #F3EC6B)", value="#F3EC6B")
-    with c2:
-        rgb_color = st.text_input("Or RGB (R,G,B)", placeholder="243,236,107")
 
-    c3, c4, c5 = st.columns(3)
-    with c3:
-        tol_h = st.number_input("Hue tolerance (±)", min_value=0, max_value=60, value=18, step=1)
-    with c4:
-        tol_s = st.number_input("Sat tolerance (±)", min_value=0, max_value=255, value=120, step=5)
-    with c5:
-        tol_v = st.number_input("Val tolerance (±)", min_value=0, max_value=255, value=120, step=5)
+    with st.expander("Advanced (optional)"):
+        st.write("Red detection defaults are good for pure #FF0000. Tweak only if needed.")
+        hue_tol = st.slider("Hue tolerance (±)", 0, 30, 10, 1)
+        sat_tol = st.slider("Saturation tolerance (±)", 0, 255, 120, 5)
+        val_tol = st.slider("Value tolerance (±)", 0, 255, 120, 5)
+        erode_px = st.slider("Interior erosion (px)", 0, 8, 3, 1, help="Move OCR crop away from the red stroke")
 
     submitted = st.form_submit_button("Process", type="primary")
 
@@ -352,9 +255,10 @@ if submitted:
             df_out, excel_buf, diag = run_pipeline(
                 image_bytes=img_file.read(),
                 excel_bytes=xlsx_file.read(),
-                hex_color=hex_color,
-                rgb_color=rgb_color,
-                tol_h=int(tol_h), tol_s=int(tol_s), tol_v=int(tol_v),
+                hue_tol=int(hue_tol),
+                sat_tol=int(sat_tol),
+                val_tol=int(val_tol),
+                erode_px=int(erode_px),
                 progress_cb=cb
             )
             st.success("Processing complete.")
@@ -366,7 +270,7 @@ if submitted:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
             with st.expander("Diagnostics"):
-                st.write(f"Dots detected: {diag['dots_found']}")
+                st.write(f"Red outlines detected: {diag['outlines_found']}")
                 fails = diag["failures"]
                 if fails:
                     st.warning(f"Issues: {len(fails)}")
