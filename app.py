@@ -262,7 +262,7 @@ if submitted:
                 progress_cb=cb
             )
             st.success("Processing complete.")
-            st.dataframe(df_out, use_container_width=True, hide_index=True)
+            st.dataframe(df_out, use_container_width=True)
             st.download_button(
                 "Download Excel",
                 data=excel_buf,
@@ -280,6 +280,6 @@ if submitted:
                 if diag["samples"]:
                     st.caption("Sample crops (first 5):")
                     for rgb_img, cap, raw in diag["samples"]:
-                        st.image(rgb_img, caption=f"{cap} | raw OCR: {raw}", use_container_width=False, hide_index=True)
+                        st.image(rgb_img, caption=f"{cap} | raw OCR: {raw}", use_container_width=False)
         except Exception as e:
             st.error(f"Failed: {e}")
