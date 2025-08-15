@@ -6,280 +6,351 @@ import pandas as pd
 import pytesseract
 import streamlit as st
 
-# If Tesseract isn't on PATH (Windows), uncomment and set this:
+# If Tesseract isn't on PATH (Windows), set it here:
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-st.set_page_config(page_title="Clip-Strip Extractor (Red Outline)", page_icon="🟥", layout="centered")
-st.title("🟥 Clip-Strip Extractor — Red Outline → Interior OCR")
-st.caption("Upload a floor plan image + store Excel. The app detects RED outlines, reads text inside, and matches to Excel.")
+st.set_page_config(page_title="Clip‑Strip Extractor (Minimal)", page_icon="🟥", layout="centered")
+st.title("🟥 Clip‑Strip Extractor — Minimal")
+st.caption("Upload one image with big red rectangles and one Excel (Export + Preferred). We OCR each rectangle once, extract bay codes, and join to Excel.")
 
-# ---------- Helpers ----------
+# -------------------- Tiny helpers --------------------
+# LOC_RE = re.compile(r"(\d-[LR]-\d{1,2})")
+LOC_RE = re.compile(r"\d+-[RL]-\d+")
+
+def parse_location(loc: str):
+    if not isinstance(loc, str): return (10**9, 10**9, 10**9)
+    m = re.match(r'^\s*(\d+)\s*-\s*([LR])\s*-\s*(\d+)\s*$', loc.upper())
+    if not m: return (10**9, 10**9, 10**9)
+    aisle = int(m.group(1)); side = 0 if m.group(2) == "L" else 1; bay = int(m.group(3))
+    return (aisle, side, bay)
+
+def sort_df(df):
+    keys = df["Location"].apply(parse_location)
+    df = df.assign(_a=[k[0] for k in keys], _s=[k[1] for k in keys], _b=[k[2] for k in keys])
+    return df.sort_values(by=["_a","_s","_b"], kind="mergesort").drop(columns=["_a","_s","_b"]).reset_index(drop=True)
+
+def norm_cols(df):
+    df = df.copy()
+    df.columns = [re.sub(r"[\s_]+","",str(c)).upper() for c in df.columns]
+    return df
+
 def norm_export_loc(s: str):
-    """Normalize Excel 'Location' to A-S-## (strip BAY, spaces, fancy dashes, zeros)."""
     s = str(s).upper().strip()
-    s = re.sub(r'\s+', '', s)
-    s = s.replace('–','-').replace('—','-')
-    m = re.match(r'(\d-[LR])-(?:BAY)?0*(\d+)$', s)
+    s = re.sub(r"\s+","",s).replace("–","-").replace("—","-")
+    m = re.match(r"^(\d-[LR])-(?:BAY)?0*(\d+)$", s)
     return f"{m.group(1)}-{m.group(2)}" if m else s
 
-def tolerant_lookup(df_export: pd.DataFrame, loc_norm: str):
-    r = df_export[df_export["LocNorm"] == loc_norm]
-    if not r.empty: return r.iloc[0]
-    r = df_export[df_export["LocNorm"].str.contains(re.escape(loc_norm), na=False)]
-    if not r.empty: return r.iloc[0]
+def pick_col(df, candidates):
+    for name in candidates:
+        k = re.sub(r"[\s_]+","",name).upper()
+        if k in df.columns: return k
+    for c in df.columns:
+        for name in candidates:
+            if re.sub(r"[\s_]+","",name).upper() in c:
+                return c
     return None
 
-def find_sheets(xls: pd.ExcelFile):
+# -------------------- Excel load (robust but minimal) --------------------
+def load_excel_tables(xls_bytes: bytes):
+    xls = pd.ExcelFile(io.BytesIO(xls_bytes))
+    # choose sheets
     export_sheet = None; pref_sheet = None
     for s in xls.sheet_names:
         sl = s.lower()
-        if export_sheet is None and "export" in sl:   export_sheet = s
-        if pref_sheet   is None and "prefer" in sl:   pref_sheet   = s
+        if export_sheet is None and "export" in sl: export_sheet = s
+        if pref_sheet   is None and "prefer" in sl: pref_sheet   = s
     export_sheet = export_sheet or xls.sheet_names[0]
     pref_sheet   = pref_sheet   or xls.sheet_names[-1]
-    return export_sheet, pref_sheet
 
-def extract_location_from_text(s):
-    """Return normalized 'A-S-##' from OCR text (handle common OCR quirks)."""
-    if not s: return None
-    t = s.upper().replace("—","-").replace("–","-")
-    t = re.sub(r'\s+', '', t).replace('I','1')
-    m = re.search(r'(\d-[RL]-\d{1,2})', t)
-    return m.group(1) if m else None
+    # Export: Location + Adjacency
+    dfe_try = pd.read_excel(xls, sheet_name=export_sheet, header=0)
+    dfe = norm_cols(dfe_try)
+    loc_col = pick_col(dfe, ["LOCATION","LOC","LOCATIONCODE","BAYLOCATION","LOCN"])
+    adj_col = pick_col(dfe, ["ADJACENCY","SECTION","CATEGORY","ADJ"])
+    if loc_col is None or adj_col is None:
+        # fallback headerless + infer
+        dfe_raw = pd.read_excel(xls, sheet_name=export_sheet, header=None)
+        def looks_loc(x):
+            t = re.sub(r"\s+","",str(x).upper().replace("—","-").replace("–","-"))
+            return bool(re.match(r"^\d+-[LR]-(?:BAY)?\d{1,2}$", t))
+        scores = [(sum(looks_loc(v) for v in dfe_raw[c].head(40)), c) for c in dfe_raw.columns]
+        scores.sort(reverse=True)
+        loc_c = scores[0][1]
+        others = [c for c in dfe_raw.columns if c != loc_c]
+        def avg_len(c): 
+            vals = dfe_raw[c].head(40).astype(str).tolist()
+            return float(np.mean([len(v) for v in vals])) if vals else 0.0
+        adj_c = max(others, key=avg_len) if others else loc_c
+        dfe = dfe_raw.rename(columns={loc_c:"LOCATION", adj_c:"ADJACENCY"})[["LOCATION","ADJACENCY"]]
+    else:
+        dfe = dfe.rename(columns={loc_col:"LOCATION", adj_col:"ADJACENCY"})[["LOCATION","ADJACENCY"]]
+    dfe["LocNorm"] = dfe["LOCATION"].apply(norm_export_loc)
 
-# ---------- Red-outline detection ----------
-def red_hsv_ranges(hue_tol=10, sat_tol=120, val_tol=120):
-    """
-    Red wraps around the HSV hue circle (0 and 180). We build two ranges:
-    low reds (~0) and high reds (~180).
-    """
-    # Base red in OpenCV HSV is around H≈0 and H≈179.
-    # We'll cover both with two masks.
-    lo1 = np.array([0,            max(0, 200 - sat_tol), max(0, 200 - val_tol)], dtype=np.uint8)
-    hi1 = np.array([hue_tol,      255,                   255],                   dtype=np.uint8)
-    lo2 = np.array([180 - hue_tol, max(0, 200 - sat_tol), max(0, 200 - val_tol)], dtype=np.uint8)
-    hi2 = np.array([179,          255,                   255],                   dtype=np.uint8)
-    return (lo1, hi1, lo2, hi2)
+    # Preferred: SECTION, PREFERRED, 2ND, 3RD (positional fallback)
+    dfp_try = pd.read_excel(xls, sheet_name=pref_sheet, header=0)
+    dfp = norm_cols(dfp_try)
+    if not any(c in dfp.columns for c in ("SECTION","CATEGORY","DEPARTMENT")):
+        dfp_raw = pd.read_excel(xls, sheet_name=pref_sheet, header=None)
+        # Force first 4 cols
+        while dfp_raw.shape[1] < 4:
+            dfp_raw[dfp_raw.shape[1]] = None
+        dfp_raw.columns = ["SECTION","PREFERRED","2ND","3RD"] + [f"X{i}" for i in range(4, dfp_raw.shape[1])]
+        dfp = norm_cols(dfp_raw[["SECTION","PREFERRED","2ND","3RD"]])
+    sec_col = pick_col(dfp, ["SECTION","CATEGORY","DEPARTMENT"]) or dfp.columns[0]
+    if sec_col != "SECTION": dfp.rename(columns={sec_col:"SECTION"}, inplace=True)
+    for c in ["PREFERRED","2ND","3RD"]:
+        if c not in dfp.columns: dfp[c] = None
+    dfp["_SECTION_NORM"] = dfp["SECTION"].astype(str).str.upper().str.strip()
 
-def detect_red_outlines(hsv_img, hue_tol=10, sat_tol=120, val_tol=120):
-    lo1, hi1, lo2, hi2 = red_hsv_ranges(hue_tol, sat_tol, val_tol)
-    mask1 = cv2.inRange(hsv_img, lo1, hi1)
-    mask2 = cv2.inRange(hsv_img, lo2, hi2)
-    mask  = cv2.bitwise_or(mask1, mask2)
+    return dfe, dfp
 
-    # Bridge tiny gaps in strokes
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, 2)
+# -------------------- Red detection (fixed thresholds + fallback) --------------------
+def detect_red_contours(bgr, min_area=100):
+    def hsv_mask(img, tol=10, smin=80, vmin=80):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        lo1 = np.array([0, smin, vmin], np.uint8)
+        hi1 = np.array([tol, 255, 255], np.uint8)
+        lo2 = np.array([180-tol, smin, vmin], np.uint8)
+        hi2 = np.array([179, 255, 255], np.uint8)
+        return cv2.inRange(hsv, lo1, hi1) | cv2.inRange(hsv, lo2, hi2)
 
-    cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return cnts, mask
+    def rgb_mask(img, thr=35):
+        b, g, r = cv2.split(img.astype(np.int16))
+        return ((r > g + thr) & (r > b + thr)).astype(np.uint8) * 255
 
-def interior_mask_from_outline(contour, shape, erode_px=3):
-    """Filled interior from an outline; erode to avoid the colored stroke."""
-    h, w = shape[:2]
-    filled = np.zeros((h, w), dtype=np.uint8)
-    cv2.drawContours(filled, [contour], -1, 255, thickness=cv2.FILLED)
-    if erode_px > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_px, erode_px))
-        filled = cv2.erode(filled, k, 1)
-    return filled
+    def contours(mask):
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        m = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Filter by minimum area to remove noise
+        return [c for c in cnts if cv2.contourArea(c) >= min_area]
 
-def crop_by_mask(bgr_img, mask):
-    ys, xs = np.where(mask > 0)
-    if len(xs) == 0 or len(ys) == 0:
-        return None, None
-    x1, x2 = xs.min(), xs.max()
-    y1, y2 = ys.min(), ys.max()
-    return bgr_img[y1:y2+1, x1:x2+1], (x1, y1, x2-x1+1, y2-y1+1)
+    # Pass 1: strict HSV
+    m1 = hsv_mask(bgr, 10, 80, 80)
+    c1 = contours(m1)
+    if c1:
+        return c1
 
-# ---------- OCR ----------
-def preprocess_box_for_ocr(box_img):
-    """OCR-friendly variants from interior region."""
-    gray = cv2.cvtColor(box_img, cv2.COLOR_BGR2GRAY)
-    up = cv2.resize(gray, None, fx=3.2, fy=3.2, interpolation=cv2.INTER_CUBIC)
+    # Pass 2: relaxed HSV
+    m2 = hsv_mask(bgr, 16, 60, 60)
+    c2 = contours(m2)
+    if c2:
+        return c2
 
+    # Pass 3: RGB fallback
+    m3 = rgb_mask(bgr, 35)
+    c3 = contours(m3)
+    return c3
+
+# -------------------- OCR (whole rectangle once) --------------------
+def remove_vertical_lines(img, line_thickness=2):
+    """Remove vertical black lines from image."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Threshold to binary (black text/lines on white background)
+    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+
+    # Create vertical kernel for line detection
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
+    vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+
+    # Invert mask to keep everything except vertical lines
+    mask = cv2.bitwise_not(vertical_lines)
+    cleaned = cv2.bitwise_and(gray, gray, mask=mask)
+
+    # Convert back to BGR for consistency
+    return cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
+
+def remove_vertical_lines(img):
+    """Remove vertical black lines from image."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
+    vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+    mask = cv2.bitwise_not(vertical_lines)
+    cleaned = cv2.bitwise_and(gray, gray, mask=mask)
+    return cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
+
+def remove_vertical_lines(img_bgr):
+    """Remove tall black vertical bay outlines before OCR."""
+    h, w = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Binary: dark lines/text -> 1
+    _, bin_inv = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+
+    # Detect vertical structures
+    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(15, h // 12)))
+    vert_mask = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN, vert_kernel, iterations=2)
+
+    # Keep only *long* vertical components (likely outlines, not glyphs)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(vert_mask, connectivity=8)
+    keep = np.ones_like(vert_mask) * 255  # start with all white (keep)
+    for i in range(1, num):
+        x, y, wcc, hcc, area = stats[i]
+        if hcc >= int(0.6 * h):  # tall enough -> treat as outline to remove
+            keep[labels == i] = 0
+
+    cleaned_gray = cv2.bitwise_and(gray, gray, mask=keep)
+    return cv2.cvtColor(cleaned_gray, cv2.COLOR_GRAY2BGR)
+
+def preprocess_variants(img_bgr):
+    """Multiple binarizations to help Tesseract."""
     variants = []
-    v_otsu = cv2.threshold(up, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    v_adap = cv2.adaptiveThreshold(up,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,35,9)
-    blur   = cv2.GaussianBlur(up,(0,0),1.0)
-    v_shrp = cv2.threshold(cv2.addWeighted(up, 1.9, blur, -0.9, 0), 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
-    ker = np.ones((2,2), np.uint8)
-    v_dil = cv2.dilate(v_otsu, ker, 1)
-    v_ero = cv2.erode(v_otsu,  ker, 1)
-    base = [v_otsu, v_adap, v_shrp, v_dil, v_ero]
-    variants.extend(base)
-    variants.extend([cv2.bitwise_not(v) for v in base])
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    variants.append(gray)
+
+    # Otsu
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(th)
+
+    # Inverted Otsu
+    variants.append(cv2.bitwise_not(th))
+
+    # Adaptive
+    th_adapt = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY, 15, 10)
+    variants.append(th_adapt)
+
     return variants
 
-def ocr_interior_text(box_img):
-    """Return (raw_text, extracted_location)."""
+def ocr_code_from_crop(crop_bgr):
+    """Return a single bay address (number-R/L-number) or None."""
+    crop_bgr = remove_vertical_lines(crop_bgr)
+
     cfgs = [
-        "--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-/ ",
-        "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-/ ",
-        "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-/ ",
+        "--oem 3 --psm 7 -c tessedit_char_whitelist=RL0123456789-",
+        "--oem 3 --psm 6 -c tessedit_char_whitelist=RL0123456789-",
+        "--oem 3 --psm 8 -c tessedit_char_whitelist=RL0123456789-",
     ]
-    best_raw = ""
-    for var in preprocess_box_for_ocr(box_img):
+
+    for var in preprocess_variants(crop_bgr):
         for cfg in cfgs:
             txt = pytesseract.image_to_string(var, config=cfg)
-            if len(txt) > len(best_raw):
-                best_raw = txt
-            loc = extract_location_from_text(txt)
-            if loc:
-                return txt, loc
-    return best_raw, extract_location_from_text(best_raw)
+            t = txt.upper().replace("—", "-").replace("–", "-")
+            t = re.sub(r"\s+", "", t)
+            m = LOC_RE.search(t)
+            if m:
+                return m.group()
+    return None
 
-# ---------- Pipeline ----------
-def run_pipeline(image_bytes: bytes, excel_bytes: bytes,
-                 hue_tol: int, sat_tol: int, val_tol: int,
-                 erode_px: int,
-                 progress_cb=lambda pct, msg: None):
+# ⬇️ DROP-IN: same name/signature you were calling before
+def ocr_codes_from_rect(crop_bgr):
+    """
+    Backward-compatible wrapper.
+    Returns a list with 0 or 1 items (exactly one bay address per rectangle).
+    """
+    code = ocr_code_from_crop(crop_bgr)
+    return [code] if code else []
+# -------------------- Main extraction --------------------
+def extract_from_image(img_bytes, xls_bytes):
+    progress = st.progress(0)
+    status_text = st.empty()
 
-    # Load Excel
-    progress_cb(10, "Loading Excel…")
-    xls = pd.ExcelFile(io.BytesIO(excel_bytes))
-    export_sheet, pref_sheet = find_sheets(xls)
+    # Step 1: Load Excel
+    status_text.text("Loading Excel...")
+    df_export, df_pref = load_excel_tables(xls_bytes)
+    progress.progress(10)
 
-    df_export = pd.read_excel(xls, sheet_name=export_sheet)
-    df_export.columns = [str(c).strip().title() for c in df_export.columns]
-    if "Location" not in df_export.columns or "Adjacency" not in df_export.columns:
-        raise RuntimeError(f"'{export_sheet}' must contain 'Location' and 'Adjacency'. Found: {df_export.columns.tolist()}")
-    df_export["LocNorm"] = df_export["Location"].apply(norm_export_loc)
-
-    df_pref = pd.read_excel(xls, sheet_name=pref_sheet)
-    df_pref.columns = [str(c).strip().upper() for c in df_pref.columns]
-    if "SECTION" not in df_pref.columns:
-        raise RuntimeError(f"'{pref_sheet}' must contain 'SECTION' (and ideally 'PREFERRED', '2ND', '3RD'). Found: {df_pref.columns.tolist()}")
-    df_pref["_SECTION_NORM"] = df_pref["SECTION"].astype(str).str.upper().str.strip()
-
-    # Decode image
-    progress_cb(20, "Reading image…")
-    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    # Step 2: Decode image
+    status_text.text("Decoding image...")
+    arr = np.frombuffer(img_bytes, np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise RuntimeError("Could not decode the uploaded image.")
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    if bgr is None: raise RuntimeError("Could not decode image.")
+    progress.progress(20)
 
-    # Detect red outlines
-    progress_cb(35, "Detecting red outlines…")
-    contours, mask_outline = detect_red_outlines(hsv, hue_tol, sat_tol, val_tol)
-    progress_cb(45, f"Found {len(contours)} outline(s).")
+    # Step 3: Detect red rectangles
+    status_text.text("Detecting red rectangles...")
+    cnts = detect_red_contours(bgr)
+    progress.progress(40)
 
-    # OCR each interior
-    progress_cb(55, f"OCR interior for {len(contours)} outline(s)…")
-    out_rows, failures, samples = [], [], []
-    total = len(contours) or 1
+    results = []
+    overlay = bgr.copy()
+    total = len(cnts)
+    for i, c in enumerate(cnts, start=1):
+        status_text.text(f"OCR on rectangle {i}/{total}...")
+        x,y,w,h = cv2.boundingRect(c)
+        mask = np.zeros(bgr.shape[:2], np.uint8)
+        cv2.drawContours(mask, [c], -1, 255, thickness=cv2.FILLED)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(4,4))
+        mask = cv2.erode(mask, k, 1)
+        ys, xs = np.where(mask>0)
+        if len(xs)==0: continue
+        x1,x2 = int(xs.min()), int(xs.max())
+        y1,y2 = int(ys.min()), int(ys.max())
+        crop = bgr[y1:y2+1, x1:x2+1]
 
-    for i, c in enumerate(contours, start=1):
-        interior_mask = interior_mask_from_outline(c, bgr.shape, erode_px=erode_px)
-        crop, rect = crop_by_mask(bgr, interior_mask)
+        codes = ocr_codes_from_rect(crop)
+        if not codes:
+            cv2.rectangle(overlay,(x,y),(x+w,y+h),(0,22,33),2)
+            cv2.putText(overlay,f"#{i}: (no code)",(x,y-6),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,22,33),2,cv2.LINE_AA)
+            continue
 
-        raw_text = None
-        loc_code = None
-        if crop is not None:
-            raw_text, loc_code = ocr_interior_text(crop)
-        else:
-            failures.append({"outline": i, "reason": "Empty interior mask"})
-
-        adjacency = preferred = second = third = None
-        if loc_code:
-            row = tolerant_lookup(df_export, loc_code)
-            if row is not None:
-                adjacency = row["Adjacency"]
+        for code in codes:
+            row = df_export[df_export["LocNorm"] == code]
+            adjacency = None
+            if not row.empty:
+                adjacency = row.iloc[0]["ADJACENCY"]
+            preferred = second = third = None
+            if adjacency is not None:
                 pr = df_pref[df_pref["_SECTION_NORM"] == str(adjacency).upper().strip()]
-                preferred = pr.iloc[0]["PREFERRED"] if ("PREFERRED" in df_pref.columns and not pr.empty) else None
-                second    = pr.iloc[0]["2ND"]       if ("2ND" in df_pref.columns       and not pr.empty) else None
-                third     = pr.iloc[0]["3RD"]       if ("3RD" in df_pref.columns       and not pr.empty) else None
-            else:
-                failures.append({"outline": i, "reason": "No Excel match", "ocr_text": raw_text})
-        else:
-            failures.append({"outline": i, "reason": "OCR empty / no location", "ocr_text": raw_text})
+                if not pr.empty:
+                    preferred = pr.iloc[0]["PREFERRED"]
+                    second    = pr.iloc[0]["2ND"]
+                    third     = pr.iloc[0]["3RD"]
+            results.append({
+                "Location": code,
+                "Adjacency": adjacency,
+                "Preferred": preferred,
+                "2nd": second,
+                "3rd": third
+            })
 
-        out_rows.append({
-            "Location": loc_code,
-            "Adjacency": adjacency,
-            "Preferred": preferred,
-            "2nd": second,
-            "3rd": third
-        })
+        # annotate overlay with all codes found
+        label = ", ".join(codes)
+        cv2.rectangle(overlay,(x,y),(x+w,y+h),(232,23,255),2)
+        cv2.putText(overlay,label,(x,y-6),cv2.FONT_HERSHEY_SIMPLEX,0.6,(232,23,255),2,cv2.LINE_AA)
 
-        if len(samples) < 5:
-            if rect is not None:
-                x, y, w, h = rect
-                pad = 12
-                x1 = max(0, x - pad); y1 = max(0, y - pad)
-                x2 = min(bgr.shape[1], x + w + pad); y2 = min(bgr.shape[0], y + h + pad)
-                crop_dbg = cv2.cvtColor(bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
-                cap = f"LOC: {loc_code or '(none)'}"
-            else:
-                crop_dbg = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                cap = "No rect"
-            samples.append((crop_dbg, cap, raw_text or ""))
+        # Update progress per rectangle
+        progress.progress(40 + int(50 * i / total))
 
-        progress_cb(55 + int(35*i/total), f"OCR & matching… ({i}/{total})")
-
-    # Output Excel
-    progress_cb(95, "Preparing output Excel…")
-    df_out = pd.DataFrame(out_rows).drop_duplicates(subset=["Location"])
-    excel_buf = io.BytesIO()
-    with pd.ExcelWriter(excel_buf, engine="xlsxwriter") as writer:
-        df_out.to_excel(writer, index=False, sheet_name="Matched")
-    excel_buf.seek(0)
-    progress_cb(100, "Done.")
-
-    diagnostics = {"outlines_found": len(contours), "failures": failures, "samples": samples}
-    return df_out, excel_buf, diagnostics
-
-# ---------- UI ----------
-with st.form("extract_form"):
-    img_file  = st.file_uploader("Floor plan image (PNG/JPG)", type=["png","jpg","jpeg"])
-    xlsx_file = st.file_uploader("Store Excel (Export + Preferred sheets)", type=["xlsx"])
-
-    with st.expander("Advanced (optional)"):
-        st.write("Red detection defaults are good for pure #FF0000. Tweak only if needed.")
-        hue_tol = st.slider("Hue tolerance (±)", 0, 30, 10, 1)
-        sat_tol = st.slider("Saturation tolerance (±)", 0, 255, 120, 5)
-        val_tol = st.slider("Value tolerance (±)", 0, 255, 120, 5)
-        erode_px = st.slider("Interior erosion (px)", 0, 8, 3, 1, help="Move OCR crop away from the red stroke")
-
-    submitted = st.form_submit_button("Process", type="primary")
-
-if submitted:
-    if not img_file or not xlsx_file:
-        st.error("Please upload both the floor plan image and the store Excel.")
+    # Step 4: Build output table
+    status_text.text("Building output Excel...")
+    df = pd.DataFrame(results, columns=["Location","Adjacency","Preferred","2nd","3rd"])
+    if not df.empty:
+        df = df.drop_duplicates(subset=["Location"])
+        df = sort_df(df)
+        df.insert(0, "No", range(1, len(df)+1))
     else:
-        prog = st.progress(0)
-        status = st.empty()
-        def cb(pct, msg): prog.progress(min(pct,100)); status.info(msg)
-        try:
-            df_out, excel_buf, diag = run_pipeline(
-                image_bytes=img_file.read(),
-                excel_bytes=xlsx_file.read(),
-                hue_tol=int(hue_tol),
-                sat_tol=int(sat_tol),
-                val_tol=int(val_tol),
-                erode_px=int(erode_px),
-                progress_cb=cb
-            )
-            st.success("Processing complete.")
-            st.dataframe(df_out, use_container_width=True)
-            st.download_button(
-                "Download Excel",
-                data=excel_buf,
-                file_name="matched_results.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-            with st.expander("Diagnostics"):
-                st.write(f"Red outlines detected: {diag['outlines_found']}")
-                fails = diag["failures"]
-                if fails:
-                    st.warning(f"Issues: {len(fails)}")
-                    st.dataframe(pd.DataFrame(fails))
-                else:
-                    st.info("No failures recorded.")
-                if diag["samples"]:
-                    st.caption("Sample crops (first 5):")
-                    for rgb_img, cap, raw in diag["samples"]:
-                        st.image(rgb_img, caption=f"{cap} | raw OCR: {raw}", use_container_width=False)
-        except Exception as e:
-            st.error(f"Failed: {e}")
+        df = pd.DataFrame(columns=["No","Location","Adjacency","Preferred","2nd","3rd"])
+    progress.progress(90)
+
+    # Step 5: Prepare downloadable Excel
+    status_text.text("Preparing Excel for download...")
+    out_buf = io.BytesIO()
+    with pd.ExcelWriter(out_buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Matched")
+    out_buf.seek(0)
+    progress.progress(100)
+    status_text.text("Done!")
+
+    # RGB preview
+    rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+    return df, out_buf, rgb
+
+# -------------------- UI --------------------
+excel_file = st.file_uploader("Upload Excel (Export + Preferred sheets)", type=["xlsx"])
+img_file   = st.file_uploader("Upload Image (PNG/JPG with red rectangles)", type=["png","jpg","jpeg"])
+
+if st.button("Process", type="primary", disabled=not(excel_file and img_file)):
+    try:
+        df_out, excel_buf, preview_rgb = extract_from_image(img_file.read(), excel_file.read())
+        if df_out.empty:
+            st.warning("No bay codes extracted. Make sure codes like '2-L-15' are fully visible inside each red rectangle and the red is near #FF0000.")
+        st.image(preview_rgb, caption="Preview (green = extracted, red = no code found)", use_container_width=True)
+        st.dataframe(df_out, use_container_width=True, hide_index=True)
+        st.download_button("Download Excel", data=excel_buf,
+                           file_name="matched_results.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception as e:
+        st.error(f"Failed: {e}")
