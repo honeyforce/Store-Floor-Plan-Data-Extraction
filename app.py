@@ -1,42 +1,25 @@
 import io
+import os
 import re
+import json
 import cv2
 import numpy as np
 import pandas as pd
 import pytesseract
 import streamlit as st
 
-# If Tesseract isn't on PATH (Windows), set it here:
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
 # -------------------- Streamlit page --------------------
 st.set_page_config(page_title="Clip‑Strip Extractor", page_icon="🟥", layout="wide")
 st.markdown("""
     <style>
-    .stApp {
-        background-color: #0E1117;
-        color: #F0F0F0;
-    }
-    .stButton>button {
-        background-color: #FF4B4B;
-        color: white;
-        height: 3em;
-        width: 10em;
-        border-radius: 12px;
-        font-weight: bold;
-    }
-    .stFileUploader>div>div>input {
-        border-radius: 12px;
-        padding: 0.5em;
-    }
-    .stProgress>div>div>div>div {
-        background-color: #4CAF50;
-    }
+    .stApp {background-color: #0E1117; color: #F0F0F0;}
+    .stButton>button {background-color: #FF4B4B; color: white; height: 3em; width: 10em; border-radius: 12px; font-weight: bold;}
+    .stFileUploader>div>div>input {border-radius: 12px; padding: 0.5em;}
+    .stProgress>div>div>div>div {background-color: #4CAF50;}
     </style>
 """, unsafe_allow_html=True)
-
 st.title("🟥 Clip‑Strip Extractor — Modern Interface")
-st.caption("Upload an image with red rectangles and an Excel file. OCR extracts bay codes and matches to Excel.")
+st.caption("Upload an image with red rectangles and Excel files. OCR extracts bay codes and matches to Excel.")
 
 # -------------------- Helpers --------------------
 LOC_RE = re.compile(r"\d+-[RL]-\d+")
@@ -193,22 +176,19 @@ def ocr_codes_from_rect(crop_bgr):
     return [code] if code else []
 
 # -------------------- Extraction --------------------
-def extract_from_image(img_bytes, xls_bytes):
+def extract_from_image(img_bytes, xls_bytes, df_pref):
     progress = st.progress(0)
     status_text = st.empty()
-
     # Load Excel
     status_text.text("Loading Excel...")
-    df_export, df_pref = load_excel_tables(xls_bytes)
+    df_export, _ = load_excel_tables(xls_bytes)  # Ignore preferred, use df_pref from session
     progress.progress(10)
-
     # Decode image
     status_text.text("Decoding image...")
     arr = np.frombuffer(img_bytes, np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None: raise RuntimeError("Could not decode image.")
     progress.progress(20)
-
     # Detect red rectangles
     status_text.text("Detecting red rectangles...")
     cnts = detect_red_contours(bgr)
@@ -277,14 +257,51 @@ def extract_from_image(img_bytes, xls_bytes):
     rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
     return df, out_buf, rgb
 
-# -------------------- UI --------------------
-st.sidebar.header("📂 Upload Files")
-excel_file = st.sidebar.file_uploader("Excel (Export + Preferred)", type=["xlsx"])
-img_file   = st.sidebar.file_uploader("Image (PNG/JPG with red rectangles)", type=["png","jpg","jpeg"])
+# -------------------- Session + File Management --------------------
+PREF_JSON = "preferred_products.json"
 
-if st.sidebar.button("Process", type="primary", disabled=not(excel_file and img_file)):
-    try:
-        df_out, excel_buf, preview_rgb = extract_from_image(img_file.read(), excel_file.read())
+def load_preferred_json():
+    if os.path.exists(PREF_JSON):
+        with open(PREF_JSON,"r",encoding="utf-8") as f:
+            data = json.load(f)
+        return pd.DataFrame(data)
+    return None
+
+def save_preferred_json(df):
+    df.to_json(PREF_JSON, orient="records", force_ascii=False)
+
+if "df_pref" not in st.session_state:
+    st.session_state.df_pref = load_preferred_json()
+if "excel_file_bytes" not in st.session_state:
+    st.session_state.excel_file_bytes = None
+if "img_file_bytes" not in st.session_state:
+    st.session_state.img_file_bytes = None
+
+st.sidebar.header("📂 Upload Files")
+pref_file = st.sidebar.file_uploader("Preferred Products Excel", type=["xlsx"])
+if pref_file:
+    _, df_pref_new = load_excel_tables(pref_file.read())
+    save_preferred_json(df_pref_new)
+    st.session_state.df_pref = df_pref_new
+    st.sidebar.success("Preferred Products updated!")
+
+excel_file = st.sidebar.file_uploader("Bay Info Excel", type=["xlsx"])
+if excel_file:
+    st.session_state.excel_file_bytes = excel_file.read()
+
+img_file = st.sidebar.file_uploader("Floor Plan Image", type=["png","jpg","jpeg"])
+if img_file:
+    st.session_state.img_file_bytes = img_file.read()
+
+if st.sidebar.button("Process"):
+    if st.session_state.df_pref is None:
+        st.warning("Upload Preferred Products first!")
+    elif st.session_state.excel_file_bytes is None or st.session_state.img_file_bytes is None:
+        st.warning("Upload Bay Info Excel and Image first!")
+    else:
+        df_out, excel_buf, preview_rgb = extract_from_image(
+            st.session_state.img_file_bytes, st.session_state.excel_file_bytes, st.session_state.df_pref
+        )
         if df_out.empty:
             st.warning("No bay codes extracted. Make sure codes like '2-L-15' are fully visible inside each red rectangle.")
         st.image(preview_rgb, caption="Preview (pink = extracted, dark = no code)", use_container_width=True)
@@ -292,5 +309,3 @@ if st.sidebar.button("Process", type="primary", disabled=not(excel_file and img_
         st.download_button("Download Excel", data=excel_buf,
                            file_name="matched_results.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    except Exception as e:
-        st.error(f"Failed: {e}")
