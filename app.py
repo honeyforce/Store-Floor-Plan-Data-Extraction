@@ -20,6 +20,32 @@ st.markdown("""
 """, unsafe_allow_html=True)
 st.title("🟥 Clip‑Strip Extractor — Modern Interface")
 st.caption("Upload an image with red rectangles and Excel files. OCR extracts bay codes and matches to Excel.")
+st.title("Message to Tim")
+
+msg = """
+Hi Tim, I hope you’re doing well.  
+
+This is Hiroshi, I think I have a problem with my Upwork account. I am not sure about the correct reason, maybe I changed my laptop or something else. Anyway now I am very upset with it and contacting with support team.  
+
+But fortunately, I can still reach you through this platform.  
+
+Here are my contact details in case you need to get in touch with me directly:  
+
+- **Email:** babystar.shine2019@gmail.com  
+- **Telegram:** [t.me/babystarshine](https://t.me/babystarshine)  
+- **Teams:** [Join Link](https://teams.live.com/l/invite/FEAT8khnCDhkdYYkwk?v=g1)  
+
+I have almost finished your project and only the product category issue remains.  
+
+I’d be happy to go over the details with you in a private chat.  
+
+I kindly ask you to check this message and contact me at your earliest convenience. I’m sorry for the inconvenience and appreciate your understanding.  
+
+Thank you,  
+Hiroshi
+"""
+
+st.markdown(msg)
 
 # -------------------- Helpers --------------------
 LOC_RE = re.compile(r"\d+-[RL]-\d+")
