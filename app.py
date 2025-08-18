@@ -1,15 +1,26 @@
+# app.py
+
 import io
 import os
 import re
 import json
+import time
+import uuid
+import threading
+from collections import deque
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Deque, List
+
 import cv2
 import numpy as np
 import pandas as pd
 import pytesseract
 import streamlit as st
+import streamlit.components.v1 as components  # for auto-scroll
 
 # -------------------- Streamlit page --------------------
-st.set_page_config(page_title="Clip‑Strip Extractor", page_icon="🟥", layout="wide")
+st.set_page_config(page_title="Clip-Strip Extractor", page_icon="🟥", layout="wide")
 st.markdown("""
     <style>
     .stApp {background-color: #0E1117; color: #F0F0F0;}
@@ -18,7 +29,7 @@ st.markdown("""
     .stProgress>div>div>div>div {background-color: #4CAF50;}
     </style>
 """, unsafe_allow_html=True)
-st.title("🟥 Clip‑Strip Extractor — Modern Interface")
+st.title("🟥 Clip-Strip Extractor — Modern Interface")
 st.caption("Upload an image with red rectangles and Excel files. OCR extracts bay codes and matches to Excel.")
 st.title("Message to Tim")
 
@@ -44,7 +55,6 @@ I kindly ask you to check this message and contact me at your earliest convenien
 Thank you,  
 Hiroshi
 """
-
 st.markdown(msg)
 
 # -------------------- Helpers --------------------
@@ -335,3 +345,170 @@ if st.sidebar.button("Process"):
         st.download_button("Download Excel", data=excel_buf,
                            file_name="matched_results.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ==================== Public Chat (Near-Realtime, No DB, PERSISTENT) ====================
+# Per-session ID to mark "my" messages vs others (no login required)
+if "my_id" not in st.session_state:
+    st.session_state.my_id = uuid.uuid4().hex
+
+st.divider()
+st.subheader("💬 Hi, Tim, I made this chat function for you! :)")
+
+# ---- Tuning ----
+REFRESH_MS      = 250         # 200–300ms is a good balance
+MAX_MESSAGES    = 1000        # messages kept in memory for display
+MAX_LEN         = 2000        # basic anti-spam (max chars per message)
+CHAT_FILE       = os.path.join("chat_data", "public_chat.jsonl")  # simple text file (JSON lines)
+SCHEMA_VERSION  = 1           # bump if fields change
+
+os.makedirs(os.path.dirname(CHAT_FILE), exist_ok=True)
+
+# ---- In-memory + file-backed store ----
+@dataclass
+class ChatMessage:
+    ts_iso: str
+    body: str
+    sender: str  # session-scoped ID
+
+class ChatStore:
+    def __init__(self, path: str, maxlen: int = MAX_MESSAGES):
+        self.path = path
+        self._lock = threading.Lock()
+        self._msgs: Deque[ChatMessage] = deque(maxlen=maxlen)
+        self._load_from_file()
+
+    def _load_from_file(self):
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        d = json.loads(line)
+                        self._msgs.append(ChatMessage(**d))
+                    except Exception:
+                        continue
+        except Exception:
+            pass  # ignore file issues; app still runs
+
+    def _append_to_file(self, msg: ChatMessage):
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(asdict(msg), ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def add(self, text: str, sender: str):
+        text = (text or "").strip()
+        if not text:
+            return
+        if len(text) > MAX_LEN:
+            text = text[:MAX_LEN] + "…"
+        msg = ChatMessage(
+            ts_iso=datetime.now().astimezone().isoformat(timespec="seconds"),
+            body=text,
+            sender=sender
+        )
+        with self._lock:
+            self._msgs.append(msg)
+            self._append_to_file(msg)
+
+    def all(self) -> List[ChatMessage]:
+        with self._lock:
+            return list(self._msgs)
+
+    def clear(self):
+        with self._lock:
+            self._msgs.clear()
+            try:
+                if os.path.exists(self.path):
+                    os.remove(self.path)
+            except Exception:
+                pass
+
+@st.cache_resource
+def get_chat_store(schema: int = SCHEMA_VERSION) -> ChatStore:
+    # 'schema' participates in the cache key—bump to reset store structure
+    return ChatStore(CHAT_FILE, maxlen=MAX_MESSAGES)
+
+_chat = get_chat_store(SCHEMA_VERSION)
+
+# Track last seen count for smooth auto-scroll
+if "chat_seen" not in st.session_state:
+    st.session_state.chat_seen = 0
+
+# ---- Auto-refresh (prefer streamlit-extras; fallback to sleep+rerun) ----
+try:
+    from streamlit_extras.st_autorefresh import st_autorefresh  # optional
+    HAVE_EXTRAS = True
+except Exception:
+    HAVE_EXTRAS = False
+    st_autorefresh = None
+
+if HAVE_EXTRAS:
+    st_autorefresh(interval=REFRESH_MS, key="chat_poll_persist")
+
+# HTML escape to avoid rendering HTML from messages
+def esc(s: str) -> str:
+    return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+# ---- Render history with left/right alignment + colors ----
+msgs = _chat.all()
+new_count = len(msgs)
+
+for m in msgs:
+    mine = (m.sender == st.session_state.my_id)
+    role = "user" if mine else "assistant"  # user => right; assistant => left
+    bg   = "#16a34a" if mine else "#ef4444" # green / red
+    fg   = "#ffffff"
+
+    with st.chat_message(role):
+        st.markdown(
+            f"""
+<div style="
+  display:inline-block; 
+  max-width: 92%;
+  background:{bg};
+  color:{fg};
+  padding:10px 12px;
+  border-radius:12px;
+  line-height:1.4;
+  word-break:break-word;">
+  <div style="opacity:0.85;font-size:12px;margin-bottom:4px;">{esc(m.ts_iso)}</div>
+  <div>{esc(m.body)}</div>
+</div>
+""",
+            unsafe_allow_html=True
+        )
+
+# Auto-scroll when there are new messages
+if new_count > st.session_state.chat_seen:
+    components.html("<script>window.scrollTo(0, document.body.scrollHeight);</script>", height=0)
+st.session_state.chat_seen = new_count
+
+# ---- Send box (instant local echo) ----
+if txt := st.chat_input("Type a public message…"):
+    _chat.add(txt, st.session_state.my_id)
+    (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
+
+# ---- Controls ----
+c1, c2, c3 = st.columns(3)
+with c1:
+    if st.button("Refresh now"):
+        (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
+# with c2:
+#     if st.button("Clear all (permanent)"):
+#         _chat.clear()
+#         st.session_state.chat_seen = 0
+#         (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
+# with c3:
+#     if st.button("Reload from file"):
+#         st.cache_resource.clear()      # drop cached store
+#         (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
+
+# ---- Fallback refresh if extras not installed ----
+if not HAVE_EXTRAS:
+    # st.caption(f"⟳ live update (fallback, {REFRESH_MS}ms)")
+    time.sleep(REFRESH_MS / 1000.0)
+    (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
+# ======================================================================
