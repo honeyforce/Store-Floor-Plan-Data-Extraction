@@ -496,11 +496,11 @@ c1, c2, c3 = st.columns(3)
 with c1:
     if st.button("Refresh now"):
         (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
-# with c2:
-#     if st.button("Clear all (permanent)"):
-#         _chat.clear()
-#         st.session_state.chat_seen = 0
-#         (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
+with c2:
+    if st.button("Clear History"):
+        _chat.clear()
+        st.session_state.chat_seen = 0
+        (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
 # with c3:
 #     if st.button("Reload from file"):
 #         st.cache_resource.clear()      # drop cached store
