@@ -19,7 +19,7 @@ st.set_page_config(page_title="Clip-Strip Extractor", page_icon="🟥", layout="
 st.markdown("""
     <style>
     .stApp {background-color: #0E1117; color: #F0F0F0;}
-    .stButton>button {background-color: #3fffaf; color: black; height: 3em; width: 25em; border-radius: 12px; font-weight: bold;}
+    .stButton>button {background-color: #3fffaf; color: black; width: 14em; border-radius: 12px; font-weight: bold;}
     .stFileUploader>div>div>input {border-radius: 12px; padding: 0.5em;}
     .stProgress>div>div>div>div {background-color: #4CAF50;}
     </style>
@@ -480,8 +480,7 @@ if txt := st.chat_input("Type a public message…"):
     (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
 
 # Manual controls only (no auto update)
-# c1, c2, c3 = st.columns(3)
-c1, c2 = st.columns(2)
+c1, c2, c3 = st.columns(3)
 with c1:
     if st.button("Please Click this button to update messages!"):
         (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
