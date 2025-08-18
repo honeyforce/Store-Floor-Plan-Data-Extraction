@@ -488,9 +488,9 @@ with c1:
 #     if st.button("Reload from file"):
 #         _chat.reload_from_disk()
 #         (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
-# with c3:
-#     if st.button("Clear Chat history"):
-#         _chat.clear()
-#         st.session_state.chat_seen = 0
-#         (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
-# ======================================================================
+with c3:
+    if st.button("Clear Chat history"):
+        _chat.clear()
+        st.session_state.chat_seen = 0
+        (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
+======================================================================
