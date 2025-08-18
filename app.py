@@ -25,7 +25,7 @@ st.title("Message to Tim")
 msg = """
 Hi Tim, I hope you’re doing well.  
 
-This is Hiroshi, I think I have a problem with my Upwork account. I am not sure about the correct reason, maybe I changed my laptop or something else. Anyway now I am very upset with it and contacting with support team.  
+This is Hiroshi, I think I have a problem with my Upwork account. I am not sure about the correct reason, maybe they thought I tried off-site communication via this platform or something else. Anyway now I am very upset with it and contacting with support team.  
 
 But fortunately, I can still reach you through this platform.  
 
