@@ -1,56 +1,25 @@
-# ==================== Public Chat (Manual Refresh, No DB, Persistent, Named) ====================
-import os, json, uuid, threading, re
-from collections import deque
-from dataclasses import dataclass, asdict
-from datetime import datetime
-from typing import Deque, List
-import streamlit as st
-import streamlit.components.v1 as components  # for one-time scroll-to-bottom
-
+import io
+import os
+import re
+import json
 import cv2
 import numpy as np
 import pandas as pd
 import pytesseract
 import streamlit as st
-import streamlit.components.v1 as components  # for auto-scroll
 
 # -------------------- Streamlit page --------------------
-st.set_page_config(page_title="Clip-Strip Extractor", page_icon="🟥", layout="wide")
+st.set_page_config(page_title="Clip‑Strip Extractor", page_icon="🟥", layout="wide")
 st.markdown("""
     <style>
     .stApp {background-color: #0E1117; color: #F0F0F0;}
-    .stButton>button {background-color: #3fffaf; color: black; width: 14em; border-radius: 12px; font-weight: bold;}
+    .stButton>button {background-color: #FF4B4B; color: white; height: 3em; width: 10em; border-radius: 12px; font-weight: bold;}
     .stFileUploader>div>div>input {border-radius: 12px; padding: 0.5em;}
     .stProgress>div>div>div>div {background-color: #4CAF50;}
     </style>
 """, unsafe_allow_html=True)
-st.title("🟥 Clip-Strip Extractor — Modern Interface")
+st.title("🟥 Clip‑Strip Extractor — Modern Interface")
 st.caption("Upload an image with red rectangles and Excel files. OCR extracts bay codes and matches to Excel.")
-st.title("Message to Tim")
-
-msg = """
-Hi Tim, I hope you’re doing well.  
-
-This is Hiroshi, I think I have a problem with my Upwork account. I am not sure about the correct reason, maybe they thought I tried off-site communication via this platform or something else. Anyway now I am very upset with it and contacting with support team.  
-
-But fortunately, I can still reach you through this platform.  
-
-Here are my contact details in case you need to get in touch with me directly:  
-
-- **Email:** babystar.shine2019@gmail.com  
-- **Telegram:** [t.me/babystarshine](https://t.me/babystarshine)  
-- **Teams:** [Join Link](https://teams.live.com/l/invite/FEAT8khnCDhkdYYkwk?v=g1)  
-
-I have almost finished your project and only the product category issue remains.  
-
-I’d be happy to go over the details with you in a private chat.  
-
-I kindly ask you to check this message and contact me at your earliest convenience. I’m sorry for the inconvenience and appreciate your understanding.  
-
-Thank you,  
-Hiroshi
-"""
-st.markdown(msg)
 
 # -------------------- Helpers --------------------
 LOC_RE = re.compile(r"\d+-[RL]-\d+")
@@ -340,157 +309,3 @@ if st.sidebar.button("Process"):
         st.download_button("Download Excel", data=excel_buf,
                            file_name="matched_results.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-# Per-session identity (no login)
-if "my_id" not in st.session_state:
-    st.session_state.my_id = uuid.uuid4().hex
-
-st.divider()
-st.subheader("💬 Hi, Tim. I made this chat function for you!")
-
-# Settings
-MAX_MESSAGES   = 2000
-MAX_LEN        = 2000
-CHAT_FILE      = os.path.join("chat_data", "public_chat.jsonl")
-SCHEMA_VERSION = 4  # bump if dataclass fields change
-os.makedirs(os.path.dirname(CHAT_FILE), exist_ok=True)
-
-# In-memory + file-backed store (no auto refresh)
-@dataclass
-class ChatLine:
-    ts: str        # formatted like 2025.08.27.17:32
-    body: str
-    sender: str    # session-scoped ID
-
-class ChatStore:
-    def __init__(self, path: str, maxlen: int = MAX_MESSAGES):
-        self.path = path
-        self._lock = threading.Lock()
-        self._msgs: Deque[ChatLine] = deque(maxlen=maxlen)
-        self._load_from_file()
-
-    def _load_from_file(self):
-        if not os.path.exists(self.path):
-            return
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        d = json.loads(line)
-                        # tolerate very old records if keys differ
-                        if "ts" in d and "body" in d and "sender" in d:
-                            self._msgs.append(ChatLine(**d))
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-    def reload_from_disk(self):
-        with self._lock:
-            self._msgs.clear()
-        self._load_from_file()
-
-    def _append_to_file(self, msg: ChatLine):
-        try:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(asdict(msg), ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-
-    def add(self, text: str, sender: str):
-        text = (text or "").strip()
-        if not text:
-            return
-        if len(text) > MAX_LEN:
-            text = text[:MAX_LEN] + "…"
-        ts_fmt = datetime.now().astimezone().strftime("%Y.%m.%d.%H:%M")  # <-- requested format
-        msg = ChatLine(ts=ts_fmt, body=text, sender=sender)
-        with self._lock:
-            self._msgs.append(msg)
-            self._append_to_file(msg)
-
-    def all(self) -> List[ChatLine]:
-        with self._lock:
-            return list(self._msgs)
-
-    def clear(self):
-        with self._lock:
-            self._msgs.clear()
-            try:
-                if os.path.exists(self.path):
-                    os.remove(self.path)
-            except Exception:
-                pass
-
-@st.cache_resource
-def get_chat_store(schema: int = SCHEMA_VERSION) -> ChatStore:
-    return ChatStore(CHAT_FILE, maxlen=MAX_MESSAGES)
-
-_chat = get_chat_store(SCHEMA_VERSION)
-
-# Track last rendered count for optional one-time autoscroll
-if "chat_seen" not in st.session_state:
-    st.session_state.chat_seen = 0
-
-# HTML escape
-def esc(s: str) -> str:
-    return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
-# Render messages (manual refresh only)
-msgs = _chat.all()
-new_count = len(msgs)
-
-for m in msgs:
-    mine = (m.sender == st.session_state.my_id)
-    role = "user" if mine else "assistant"  # right vs left alignment in st.chat_message
-    name = "Hiroshi" if mine else "Tim"     # fixed names as requested
-    bg   = "#16a34a" if mine else "#ef4444" # green / red
-    fg   = "#ffffff"
-
-    with st.chat_message(role):
-        st.markdown(
-            f"""
-<div style="
-  display:inline-block; 
-  max-width: 92%;
-  background:{bg};
-  color:{fg};
-  padding:10px 12px;
-  border-radius:12px;
-  line-height:1.4;
-  word-break:break-word;">
-  <div style="display:flex;justify-content:space-between;opacity:0.9;font-size:12px;margin-bottom:6px;">
-    <strong>{esc(name)}</strong>
-    <span>{esc(m.ts)}</span>
-  </div>
-  <div>{esc(m.body)}</div>
-</div>
-""",
-            unsafe_allow_html=True
-        )
-
-# One-time scroll to bottom if new messages appeared since last render
-if new_count > st.session_state.chat_seen:
-    components.html("<script>window.scrollTo(0, document.body.scrollHeight);</script>", height=0)
-st.session_state.chat_seen = new_count
-
-# Send box (sending triggers immediate rerun)
-if txt := st.chat_input("Type a public message…"):
-    _chat.add(txt, st.session_state.my_id)
-    (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
-
-# Manual controls only (no auto update)
-c1, c2, c3 = st.columns(3)
-with c1:
-    if st.button("Please Click this button to update messages!"):
-        (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
-# with c2:
-#     if st.button("Reload from file"):
-#         _chat.reload_from_disk()
-#         (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
-with c3:
-    if st.button("Clear Chat history"):
-        _chat.clear()
-        st.session_state.chat_seen = 0
-        (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
-# ======================================================================
