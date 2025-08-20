@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytesseract
 import streamlit as st
+import camelot
 
 # -------------------- Streamlit page --------------------
 st.set_page_config(page_title="Clip‑Strip Extractor", page_icon="🟥", layout="wide")
@@ -18,8 +19,8 @@ st.markdown("""
     .stProgress>div>div>div>div {background-color: #4CAF50;}
     </style>
 """, unsafe_allow_html=True)
-st.title("🟥 Clip‑Strip Extractor — Modern Interface")
-st.caption("Upload an image with red rectangles and Excel files. OCR extracts bay codes and matches to Excel.")
+st.title("🟥 Clip‑Strip Extractor — PDF + Preferred Excel")
+st.caption("Upload Floor Plan Image, Bay Info PDF, and Preferred Products Excel.")
 
 # -------------------- Helpers --------------------
 LOC_RE = re.compile(r"\d+-[RL]-\d+")
@@ -41,12 +42,6 @@ def norm_cols(df):
     df.columns = [re.sub(r"[\s_]+","",str(c)).upper() for c in df.columns]
     return df
 
-def norm_export_loc(s: str):
-    s = str(s).upper().strip()
-    s = re.sub(r"\s+","",s).replace("–","-").replace("—","-")
-    m = re.match(r"^(\d-[LR])-(?:BAY)?0*(\d+)$", s)
-    return f"{m.group(1)}-{m.group(2)}" if m else s
-
 def pick_col(df, candidates):
     for name in candidates:
         k = re.sub(r"[\s_]+","",name).upper()
@@ -57,7 +52,71 @@ def pick_col(df, candidates):
                 return c
     return None
 
-# -------------------- Excel Loader --------------------
+# -------------------- PDF Loader --------------------
+def pdf_to_excel_clean(pdf_bytes: bytes):
+    tables = camelot.read_pdf(io.BytesIO(pdf_bytes), pages="all", flavor="stream", strip_text='\n')
+    if not tables:
+        raise RuntimeError("No table data extracted from PDF via OCR.")
+    
+    df = pd.concat([t.df for t in tables if not t.df.empty], ignore_index=True)
+
+    # Remove first row if all numeric
+    if df.iloc[0].apply(lambda x: str(x).isdigit()).all():
+        df = df.iloc[1:].reset_index(drop=True)
+
+    # Remove rows containing "PLANOGRAM LISTING"
+    df = df[~df.apply(lambda row: row.astype(str).str.upper().str.contains("PLANOGRAM LISTING").any(), axis=1)]
+    df = df.reset_index(drop=True)
+
+    # Use first row as header
+    df.columns = df.iloc[0]
+    df = df[1:].reset_index(drop=True)
+
+    # Normalize column names
+    df.columns = [str(c).strip().replace("\n","").replace(".","").upper() for c in df.columns]
+
+    # Flexible column mapping
+    mapping = {}
+    for col in df.columns:
+        col_clean = col.replace(" ","").upper()
+        if "PLANOGRAM" in col_clean:
+            mapping[col] = "PLANOGRAM NAME"
+        elif "AISLE" in col_clean and "NO" in col_clean:
+            mapping[col] = "AISLE NO"
+        elif "SIDE" in col_clean:
+            mapping[col] = "AISLE SIDE"
+        elif "SIZE" in col_clean:
+            mapping[col] = "SIZE"
+    df = df.rename(columns=mapping)
+
+    required_cols = ["PLANOGRAM NAME","AISLE NO","AISLE SIDE","SIZE"]
+    if not all(c in df.columns for c in required_cols):
+        raise RuntimeError(f"PDF missing required columns after normalization: {required_cols}")
+
+    # Convert SIZE to numeric and calculate cumulative per AISLE+SIDE
+    df["SIZE"] = pd.to_numeric(df["SIZE"], errors="coerce").fillna(0.0)
+    df["CUM_SIZE"] = 0.0
+    for keys, group in df.groupby(["AISLE NO","AISLE SIDE"]):
+        cum = 0.0
+        for idx in group.index:
+            cum += df.at[idx,"SIZE"]
+            df.at[idx,"CUM_SIZE"] = cum
+
+    return df
+
+# -------------------- Preferred Excel Loader --------------------
+PREF_JSON = "preferred_products.json"
+
+def load_preferred_json():
+    if os.path.exists(PREF_JSON):
+        with open(PREF_JSON,"r",encoding="utf-8") as f:
+            data = json.load(f)
+        return pd.DataFrame(data)
+    return None
+
+def save_preferred_json(df):
+    df.to_json(PREF_JSON, orient="records", force_ascii=False)
+
 def load_excel_tables(xls_bytes: bytes):
     xls = pd.ExcelFile(io.BytesIO(xls_bytes))
     export_sheet = None; pref_sheet = None
@@ -67,29 +126,6 @@ def load_excel_tables(xls_bytes: bytes):
         if pref_sheet   is None and "prefer" in sl: pref_sheet   = s
     export_sheet = export_sheet or xls.sheet_names[0]
     pref_sheet   = pref_sheet   or xls.sheet_names[-1]
-
-    # Export
-    dfe_try = pd.read_excel(xls, sheet_name=export_sheet, header=0)
-    dfe = norm_cols(dfe_try)
-    loc_col = pick_col(dfe, ["LOCATION","LOC","LOCATIONCODE","BAYLOCATION","LOCN"])
-    adj_col = pick_col(dfe, ["ADJACENCY","SECTION","CATEGORY","ADJ"])
-    if loc_col is None or adj_col is None:
-        dfe_raw = pd.read_excel(xls, sheet_name=export_sheet, header=None)
-        def looks_loc(x):
-            t = re.sub(r"\s+","",str(x).upper().replace("—","-").replace("–","-"))
-            return bool(re.match(r"^\d+-[LR]-(?:BAY)?\d{1,2}$", t))
-        scores = [(sum(looks_loc(v) for v in dfe_raw[c].head(40)), c) for c in dfe_raw.columns]
-        scores.sort(reverse=True)
-        loc_c = scores[0][1]
-        others = [c for c in dfe_raw.columns if c != loc_c]
-        def avg_len(c): 
-            vals = dfe_raw[c].head(40).astype(str).tolist()
-            return float(np.mean([len(v) for v in vals])) if vals else 0.0
-        adj_c = max(others, key=avg_len) if others else loc_c
-        dfe = dfe_raw.rename(columns={loc_c:"LOCATION", adj_c:"ADJACENCY"})[["LOCATION","ADJACENCY"]]
-    else:
-        dfe = dfe.rename(columns={loc_col:"LOCATION", adj_col:"ADJACENCY"})[["LOCATION","ADJACENCY"]]
-    dfe["LocNorm"] = dfe["LOCATION"].apply(norm_export_loc)
 
     # Preferred
     dfp_try = pd.read_excel(xls, sheet_name=pref_sheet, header=0)
@@ -105,31 +141,7 @@ def load_excel_tables(xls_bytes: bytes):
     for c in ["PREFERRED","2ND","3RD"]:
         if c not in dfp.columns: dfp[c] = None
     dfp["_SECTION_NORM"] = dfp["SECTION"].astype(str).str.upper().str.strip()
-    return dfe, dfp
-
-# -------------------- Red detection --------------------
-def detect_red_contours(bgr, min_area=100):
-    def hsv_mask(img, tol=10, smin=80, vmin=80):
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        lo1 = np.array([0, smin, vmin], np.uint8)
-        hi1 = np.array([tol, 255, 255], np.uint8)
-        lo2 = np.array([180-tol, smin, vmin], np.uint8)
-        hi2 = np.array([179, 255, 255], np.uint8)
-        return cv2.inRange(hsv, lo1, hi1) | cv2.inRange(hsv, lo2, hi2)
-    def rgb_mask(img, thr=35):
-        b, g, r = cv2.split(img.astype(np.int16))
-        return ((r > g + thr) & (r > b + thr)).astype(np.uint8) * 255
-    def contours(mask):
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        m = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
-        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        return [c for c in cnts if cv2.contourArea(c) >= min_area]
-    for mask_func in [lambda img: hsv_mask(img,10,80,80),
-                      lambda img: hsv_mask(img,16,60,60),
-                      rgb_mask]:
-        c = contours(mask_func(bgr))
-        if c: return c
-    return []
+    return None, dfp
 
 # -------------------- OCR --------------------
 def remove_vertical_lines(img_bgr):
@@ -175,20 +187,98 @@ def ocr_codes_from_rect(crop_bgr):
     code = ocr_code_from_crop(crop_bgr)
     return [code] if code else []
 
+def load_pdf_to_excel(pdf_bytes):
+    """
+    Convert PDF bay info into a cleaned Excel-like DataFrame.
+    Removes top numeric row and 'PLANOGRAM LISTING' rows,
+    normalizes headers, strips trailing dots, and calculates cumulative size per aisle & side.
+    """
+    # Read tables from PDF using Camelot
+    tables = camelot.read_pdf(io.BytesIO(pdf_bytes), pages="all", flavor="stream", strip_text='\n')
+    if not tables:
+        raise RuntimeError("No table data extracted from PDF via OCR.")
+
+    # Combine all tables
+    df = pd.concat([t.df for t in tables if not t.df.empty], ignore_index=True)
+
+    # --- CLEANING ---
+
+    # Remove first row if all values are numeric (0,1,2,...)
+    if df.iloc[0].apply(lambda x: str(x).isdigit()).all():
+        df = df.iloc[1:].reset_index(drop=True)
+
+    # Remove rows containing "PLANOGRAM LISTING"
+    df = df[~df.apply(lambda row: row.astype(str).str.upper().str.contains("PLANOGRAM LISTING").any(), axis=1)]
+    df = df.reset_index(drop=True)
+
+    # Use first row as header
+    df.columns = [str(c).strip().replace("\n"," ").replace("\r"," ").upper() for c in df.iloc[0]]
+    df = df[1:].reset_index(drop=True)
+
+    # Remove trailing dots in headers
+    df.columns = [c.rstrip('.') for c in df.columns]
+
+    # Check required columns
+    required_cols = ["PLANOGRAM NAME", "AISLE NO", "AISLE SIDE", "SIZE"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"PDF missing required columns: {missing}")
+
+    # Convert numeric columns
+    df["AISLE NO"] = pd.to_numeric(df["AISLE NO"], errors="coerce")
+    df["SIZE"] = pd.to_numeric(df["SIZE"], errors="coerce")
+
+    # Fill cumulative size per aisle & side
+    df["CUM_SIZE"] = df.groupby(["AISLE NO", "AISLE SIDE"])["SIZE"].cumsum()
+
+    return df
+# -------------------- Red detection --------------------
+def detect_red_contours(bgr, min_area=100):
+    import cv2
+    import numpy as np
+
+    def hsv_mask(img, tol=10, smin=80, vmin=80):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        lo1 = np.array([0, smin, vmin], np.uint8)
+        hi1 = np.array([tol, 255, 255], np.uint8)
+        lo2 = np.array([180-tol, smin, vmin], np.uint8)
+        hi2 = np.array([179, 255, 255], np.uint8)
+        return cv2.inRange(hsv, lo1, hi1) | cv2.inRange(hsv, lo2, hi2)
+
+    def rgb_mask(img, thr=35):
+        b, g, r = cv2.split(img.astype(np.int16))
+        return ((r > g + thr) & (r > b + thr)).astype(np.uint8) * 255
+
+    def contours(mask):
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        m = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return [c for c in cnts if cv2.contourArea(c) >= min_area]
+
+    for mask_func in [lambda img: hsv_mask(img,10,80,80),
+                      lambda img: hsv_mask(img,16,60,60),
+                      rgb_mask]:
+        c = contours(mask_func(bgr))
+        if c: return c
+    return []
+
 # -------------------- Extraction --------------------
-def extract_from_image(img_bytes, xls_bytes, df_pref):
+def extract_from_image(img_bytes, pdf_bytes, df_pref):
     progress = st.progress(0)
     status_text = st.empty()
-    # Load Excel
-    status_text.text("Loading Excel...")
-    df_export, _ = load_excel_tables(xls_bytes)  # Ignore preferred, use df_pref from session
+    
+    # Load PDF and process tables
+    status_text.text("Loading PDF...")
+    df_export = load_pdf_to_excel(pdf_bytes)  # your PDF-to-Excel cleaning function
     progress.progress(10)
+    
     # Decode image
     status_text.text("Decoding image...")
     arr = np.frombuffer(img_bytes, np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None: raise RuntimeError("Could not decode image.")
     progress.progress(20)
+    
     # Detect red rectangles
     status_text.text("Detecting red rectangles...")
     cnts = detect_red_contours(bgr)
@@ -197,6 +287,7 @@ def extract_from_image(img_bytes, xls_bytes, df_pref):
     results = []
     overlay = bgr.copy()
     total = len(cnts)
+    
     for i, c in enumerate(cnts, start=1):
         status_text.text(f"OCR on rectangle {i}/{total}...")
         x,y,w,h = cv2.boundingRect(c)
@@ -217,9 +308,20 @@ def extract_from_image(img_bytes, xls_bytes, df_pref):
             continue
 
         for code in codes:
-            row = df_export[df_export["LocNorm"]==code]
-            adjacency=None
-            if not row.empty: adjacency=row.iloc[0]["ADJACENCY"]
+            # Parse bay code
+            aisle_str, side, bay_str = code.split("-")
+            aisle = int(aisle_str)
+            bay_number = int(bay_str)
+            
+            # Correct cumulative lookup
+            row = df_export[
+                (df_export["AISLE NO"]==aisle) &
+                (df_export["AISLE SIDE"].str.upper()==side.upper()) &
+                (df_export["CUM_SIZE"] >= bay_number)
+            ].sort_values("CUM_SIZE").head(1)
+            
+            adjacency = row.iloc[0]["PLANOGRAM NAME"] if not row.empty else None
+            
             preferred=second=third=None
             if adjacency is not None:
                 pr = df_pref[df_pref["_SECTION_NORM"]==str(adjacency).upper().strip()]
@@ -234,7 +336,7 @@ def extract_from_image(img_bytes, xls_bytes, df_pref):
         cv2.putText(overlay,label,(x,y-6),cv2.FONT_HERSHEY_SIMPLEX,0.6,(232,23,255),2,cv2.LINE_AA)
         progress.progress(40 + int(50*i/total))
 
-    # Output DataFrame
+    # Build output DataFrame
     status_text.text("Building output Excel...")
     df = pd.DataFrame(results, columns=["Location","Adjacency","Preferred","2nd","3rd"])
     if not df.empty:
@@ -245,7 +347,7 @@ def extract_from_image(img_bytes, xls_bytes, df_pref):
         df = pd.DataFrame(columns=["No","Location","Adjacency","Preferred","2nd","3rd"])
     progress.progress(90)
 
-    # Prepare Excel
+    # Prepare Excel for download
     status_text.text("Preparing Excel for download...")
     out_buf = io.BytesIO()
     with pd.ExcelWriter(out_buf, engine="xlsxwriter") as writer:
@@ -257,25 +359,13 @@ def extract_from_image(img_bytes, xls_bytes, df_pref):
     rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
     return df, out_buf, rgb
 
-# -------------------- Session + File Management --------------------
-PREF_JSON = "preferred_products.json"
-
-def load_preferred_json():
-    if os.path.exists(PREF_JSON):
-        with open(PREF_JSON,"r",encoding="utf-8") as f:
-            data = json.load(f)
-        return pd.DataFrame(data)
-    return None
-
-def save_preferred_json(df):
-    df.to_json(PREF_JSON, orient="records", force_ascii=False)
-
+# -------------------- Session + Uploads --------------------
 if "df_pref" not in st.session_state:
     st.session_state.df_pref = load_preferred_json()
-if "excel_file_bytes" not in st.session_state:
-    st.session_state.excel_file_bytes = None
-if "img_file_bytes" not in st.session_state:
-    st.session_state.img_file_bytes = None
+if "pdf_bytes" not in st.session_state:
+    st.session_state.pdf_bytes = None
+if "img_bytes" not in st.session_state:
+    st.session_state.img_bytes = None
 
 st.sidebar.header("📂 Upload Files")
 pref_file = st.sidebar.file_uploader("Preferred Products Excel", type=["xlsx"])
@@ -285,22 +375,22 @@ if pref_file:
     st.session_state.df_pref = df_pref_new
     st.sidebar.success("Preferred Products updated!")
 
-excel_file = st.sidebar.file_uploader("Bay Info Excel", type=["xlsx"])
-if excel_file:
-    st.session_state.excel_file_bytes = excel_file.read()
+pdf_file = st.sidebar.file_uploader("Bay Info PDF", type=["pdf"])
+if pdf_file:
+    st.session_state.pdf_bytes = pdf_file.read()
 
 img_file = st.sidebar.file_uploader("Floor Plan Image", type=["png","jpg","jpeg"])
 if img_file:
-    st.session_state.img_file_bytes = img_file.read()
+    st.session_state.img_bytes = img_file.read()
 
 if st.sidebar.button("Process"):
     if st.session_state.df_pref is None:
         st.warning("Upload Preferred Products first!")
-    elif st.session_state.excel_file_bytes is None or st.session_state.img_file_bytes is None:
-        st.warning("Upload Bay Info Excel and Image first!")
+    elif st.session_state.pdf_bytes is None or st.session_state.img_bytes is None:
+        st.warning("Upload Bay Info PDF and Image first!")
     else:
         df_out, excel_buf, preview_rgb = extract_from_image(
-            st.session_state.img_file_bytes, st.session_state.excel_file_bytes, st.session_state.df_pref
+            st.session_state.img_bytes, st.session_state.pdf_bytes, st.session_state.df_pref
         )
         if df_out.empty:
             st.warning("No bay codes extracted. Make sure codes like '2-L-15' are fully visible inside each red rectangle.")
