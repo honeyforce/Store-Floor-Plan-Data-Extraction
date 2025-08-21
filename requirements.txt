@@ -1,7 +1,8 @@
-opencv-python
-pytesseract
+streamlit
 pandas
 numpy
-XlsxWriter
-streamlit
-openpyxl
+opencv-python-headless
+pytesseract
+camelot-py[cv]
+xlsxwriter
+pdf2image
